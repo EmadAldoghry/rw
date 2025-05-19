@@ -1,0 +1,27 @@
+# Material library for final_cut_road_model
+
+newmtl RoadSurface
+Ka 1.0 1.0 1.0
+Kd 1.0 1.0 1.0
+Ks 0.1 0.1 0.1
+Ns 10
+d 1.0
+illum 2
+map_Kd road_texture.png
+
+newmtl RoadBottom
+Ka 0.7 0.7 0.7
+Kd 0.7 0.7 0.7
+Ks 0.0 0.0 0.0
+Ns 10
+d 1.0
+illum 1
+
+newmtl RoadSides
+Ka 0.8 0.8 0.8
+Kd 0.8 0.8 0.8
+Ks 0.0 0.0 0.0
+Ns 10
+d 1.0
+illum 1
+
