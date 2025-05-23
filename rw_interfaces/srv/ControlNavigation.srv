@@ -1,0 +1,5 @@
+uint8 command # 0: NO_OP, 1: START, 2: PAUSE, 3: RESUME, 4: CANCEL
+# Define constants in your Python node for these commands
+---
+bool success
+string message
