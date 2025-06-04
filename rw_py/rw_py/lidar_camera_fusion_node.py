@@ -2,373 +2,307 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time as RclpyTime
+from rclpy.duration import Duration as RclpyDuration
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.duration import Duration as rclpyDuration
 
+from sensor_msgs.msg import Image, PointCloud2
+from std_msgs.msg import Header
+from geometry_msgs.msg import PoseStamped as GeometryPoseStamped, PointStamped, Quaternion, Point
+from sensor_msgs_py import point_cloud2 as pc2
+from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
-from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2
-import sensor_msgs_py.point_cloud2 as pc2
-import message_filters
-import tf2_ros
-from tf2_ros import LookupException, ConnectivityException, ExtrapolationException, Duration
-import tf2_geometry_msgs
-from geometry_msgs.msg import PointStamped
 import math
-import threading
-import time # For small sleeps if needed
-import traceback # For detailed error messages
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
+import tf_transformations
+import traceback
 
-class LidarCameraFuser(Node):
+from std_srvs.srv import SetBool
+
+class ROILidarFusionNode(Node):
     def __init__(self):
-        super().__init__('lidar_camera_fuser')
-        self.get_logger().info("Node __init__ started.")
+        super().__init__('roi_lidar_fusion_node_activated')
+        
+        self.declare_parameter('input_image_topic', 'camera/image')
+        self.declare_parameter('input_pc_topic', 'scan_02/points')
+        self.declare_parameter('output_window', 'Fused View')
+        self.declare_parameter('output_selected_pc_topic', 'selected_lidar_points')
+        self.declare_parameter('output_corrected_goal_topic', '/corrected_local_goal')
+        self.declare_parameter('navigation_frame', 'map')
+        self.declare_parameter('img_w', 1920)
+        self.declare_parameter('img_h', 1200)
+        self.img_w_param = self.get_parameter('img_w').get_parameter_value().integer_value
+        self.img_h_param = self.get_parameter('img_h').get_parameter_value().integer_value
 
-        self.bridge = CvBridge()
+        default_roi_x_start = int(self.img_w_param * 0 / 100.0)
+        default_roi_y_start = int(self.img_h_param * 19 / 100.0)
+        default_roi_x_end = int(self.img_w_param * 100 / 100.0)
+        default_roi_y_end = int(self.img_h_param * 76 / 100.0)
 
-        # --- OpenCV Window Names ---
-        self.cv_raw_camera_window_name = "Raw Camera Image"
-        self.cv_lidar_bev_window_name = "LiDAR BEV"
-        self.cv_fused_window_name = "Lidar-Camera Fused Projection"
+        self.declare_parameter('roi_x_start', default_roi_x_start)
+        self.declare_parameter('roi_y_start', default_roi_y_start)
+        self.declare_parameter('roi_x_end', default_roi_x_end)
+        self.declare_parameter('roi_y_end', default_roi_y_end)
+        self.declare_parameter('enable_black_segmentation', True)
+        for name, default in [('black_h_min', 0), ('black_s_min', 0), ('black_v_min', 0),
+                              ('black_h_max', 180), ('black_s_max', 255), ('black_v_max', 50)]:
+            self.declare_parameter(name, default)
+        self.declare_parameter('point_display_mode', 2)
+        self.declare_parameter('hfov', 1.25)
+        self.declare_parameter('min_dist_colorize', 1.5)
+        self.declare_parameter('max_dist_colorize', 5.0)
+        self.declare_parameter('point_radius_viz', 2)
+        self.declare_parameter('colormap_viz', cv2.COLORMAP_JET)
+        self.declare_parameter('camera_optical_frame', 'front_camera_link_optical')
+        self.declare_parameter('lidar_optical_frame', 'front_lidar_link_optical')
+        self.declare_parameter('static_transform_lookup_timeout_sec', 5.0)
 
-        # Data to be displayed
-        self.latest_raw_cv_image = None
-        self.latest_bev_cv_image = None
-        self.latest_fused_cv_image = None
-        self.data_lock = threading.Lock()
+        self.input_image_topic_ = self.get_parameter('input_image_topic').value
+        self.input_pc_topic_ = self.get_parameter('input_pc_topic').value
+        self.output_window_ = self.get_parameter('output_window').value
+        self.output_selected_pc_topic_ = self.get_parameter('output_selected_pc_topic').value
+        self.output_corrected_goal_topic_ = self.get_parameter('output_corrected_goal_topic').value
+        self.navigation_frame_ = self.get_parameter('navigation_frame').value
+        self.roi_x_start = self.get_parameter('roi_x_start').value
+        self.roi_y_start = self.get_parameter('roi_y_start').value
+        self.roi_x_end = self.get_parameter('roi_x_end').value
+        self.roi_y_end = self.get_parameter('roi_y_end').value
+        self.enable_seg_param_ = self.get_parameter('enable_black_segmentation').value
+        self.h_min, self.s_min, self.v_min = self.get_parameter('black_h_min').value, self.get_parameter('black_s_min').value, self.get_parameter('black_v_min').value
+        self.h_max, self.s_max, self.v_max = self.get_parameter('black_h_max').value, self.get_parameter('black_s_max').value, self.get_parameter('black_v_max').value
+        self.point_display_mode_ = self.get_parameter('point_display_mode').value
+        self.hfov_ = self.get_parameter('hfov').value
+        self.min_dist_colorize_ = self.get_parameter('min_dist_colorize').value
+        self.max_dist_colorize_ = self.get_parameter('max_dist_colorize').value
+        self.point_radius_viz_ = self.get_parameter('point_radius_viz').value
+        self.colormap_viz_ = self.get_parameter('colormap_viz').value
+        self.camera_optical_frame_ = self.get_parameter('camera_optical_frame').value
+        self.lidar_optical_frame_ = self.get_parameter('lidar_optical_frame').value
+        self.tf_timeout_sec_ = self.get_parameter('static_transform_lookup_timeout_sec').value
 
-        # --- Parameters ---
-        # ... (parameter declaration and fetching as before) ...
-        self.declare_parameter("image_topic", "/camera/image")
-        self.declare_parameter("camera_info_topic", "/camera/camera_info")
-        self.declare_parameter("lidar_topic", "/scan_02/points")
-        self.declare_parameter("output_image_topic", "/fused_projection/image")
-        self.declare_parameter("camera_optical_frame", "front_camera_link_optical")
-        self.declare_parameter("lidar_optical_frame", "lidar_link_optical")
+        self.roi_x_start = max(0, self.roi_x_start); self.roi_y_start = max(0, self.roi_y_start)
+        self.roi_x_end = min(self.img_w_param, self.roi_x_end); self.roi_y_end = min(self.img_h_param, self.roi_y_end)
+        if not (self.roi_x_start < self.roi_x_end and self.roi_y_start < self.roi_y_end):
+            self.get_logger().error("Invalid ROI, defaulting to full image.")
+            self.roi_x_start, self.roi_y_start = 0, 0; self.roi_x_end, self.roi_y_end = self.img_w_param, self.img_h_param
+        self.get_logger().info(f"ROI: x=[{self.roi_x_start},{self.roi_x_end}), y=[{self.roi_y_start},{self.roi_y_end})")
 
-        image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
-        camera_info_topic = self.get_parameter("camera_info_topic").get_parameter_value().string_value
-        lidar_topic = self.get_parameter("lidar_topic").get_parameter_value().string_value
-        self.output_image_topic = self.get_parameter("output_image_topic").get_parameter_value().string_value
-        self.camera_optical_frame = self.get_parameter("camera_optical_frame").get_parameter_value().string_value
-        self.lidar_optical_frame = self.get_parameter("lidar_optical_frame").get_parameter_value().string_value
+        self.fx_ = self.img_w_param / (2 * math.tan(self.hfov_ / 2.0)); self.fy_ = self.fx_
+        self.cx_ = self.img_w_param / 2.0; self.cy_ = self.img_h_param / 2.0
+        self.get_logger().info(f"Cam Intrinsics: fx={self.fx_:.2f}, fy={self.fy_:.2f}, cx={self.cx_:.2f}, cy={self.cy_:.2f}")
 
+        self.bridge_ = CvBridge(); self.latest_image_ = None; self.latest_pc_ = None
+        self.tf_buffer_ = tf2_ros.Buffer(); self.tf_listener_ = tf2_ros.TransformListener(self.tf_buffer_, self)
+        self.static_transform_lidar_to_cam_ = None
+        self.process_and_publish_target_ = False
 
-        # --- TF2 ---
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        if self.output_window_: cv2.namedWindow(self.output_window_, cv2.WINDOW_NORMAL); cv2.resizeWindow(self.output_window_, 800, 600)
 
-        # --- QoS ---
-        qos_sensor_data = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT, # Changed to BEST_EFFORT for image/lidar
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1 # Keep only the latest for high-rate sensors
-        )
-        qos_camera_info = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.VOLATILE # Usually good for Gazebo's CameraInfo
-        )
-        self.get_logger().info(f"QoS for Image ({image_topic}): R={qos_sensor_data.reliability}, H={qos_sensor_data.history}, D={qos_sensor_data.depth}")
-        self.get_logger().info(f"QoS for CameraInfo ({camera_info_topic}): R={qos_camera_info.reliability}, D={qos_camera_info.durability}, H={qos_camera_info.history}, Depth={qos_camera_info.depth}")
-        self.get_logger().info(f"QoS for Lidar ({lidar_topic}): R={qos_sensor_data.reliability}, H={qos_sensor_data.history}, D={qos_sensor_data.depth}")
+        self.selected_points_publisher_ = self.create_publisher(PointCloud2, self.output_selected_pc_topic_, 10)
+        _qos_reliable_transient = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.corrected_goal_publisher_ = self.create_publisher(GeometryPoseStamped, self.output_corrected_goal_topic_, _qos_reliable_transient)
+        
+        qos_sensor = rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value
+        self.create_subscription(Image, self.input_image_topic_, self.image_cb, qos_sensor)
+        self.create_subscription(PointCloud2, self.input_pc_topic_, self.pc_cb, qos_sensor)
+        self.activation_service_ = self.create_service(SetBool, '~/activate_segmentation', self.handle_activation_request)
+        
+        self.timer_ = self.create_timer(1.0 / 15.0, self.timer_cb)
+        self.get_logger().info('ROI-LiDAR Fusion Node (with activation) started. Target processing INACTIVE.')
 
+    def handle_activation_request(self, request: SetBool.Request, response: SetBool.Response):
+        self.process_and_publish_target_ = request.data
+        response.message = f"Target processing and goal publishing {'ACTIVATED' if request.data else 'DEACTIVATED'}."
+        self.get_logger().info(response.message)
+        if not self.process_and_publish_target_: # If deactivating, publish an invalid goal
+            self._publish_invalid_goal("Deactivated by service call.")
+        response.success = True
+        return response
 
-        # --- Subscribers ---
-        # Adding individual callbacks for debugging
-        self.image_sub_debug = self.create_subscription(Image, image_topic, self.image_debug_callback, qos_sensor_data)
-        self.cam_info_sub_debug = self.create_subscription(CameraInfo, camera_info_topic, self.cam_info_debug_callback, qos_camera_info)
-        self.lidar_sub_debug = self.create_subscription(PointCloud2, lidar_topic, self.lidar_debug_callback, qos_sensor_data)
-        self.get_logger().info("Individual debug subscribers created.")
+    def _publish_invalid_goal(self, reason=""):
+        invalid_goal_pose = GeometryPoseStamped()
+        invalid_goal_pose.header.stamp = self.get_clock().now().to_msg()
+        invalid_goal_pose.header.frame_id = "" # Empty frame_id signifies invalid/no target
+        self.corrected_goal_publisher_.publish(invalid_goal_pose)
+        self.get_logger().debug(f"Published invalid goal. Reason: {reason}")
 
-
-        image_sub = message_filters.Subscriber(self, Image, image_topic, qos_profile=qos_sensor_data)
-        camera_info_sub = message_filters.Subscriber(self, CameraInfo, camera_info_topic, qos_profile=qos_camera_info)
-        lidar_sub = message_filters.Subscriber(self, PointCloud2, lidar_topic, qos_profile=qos_sensor_data)
-        self.get_logger().info("Message_filters subscribers created.")
-
-        # --- Synchronizer ---
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [image_sub, camera_info_sub, lidar_sub],
-            queue_size=30, # Increased queue
-            slop=0.5       # Increased slop significantly for debugging
-        )
-        self.ts.registerCallback(self.synchronized_callback)
-        self.get_logger().info(f"ApproximateTimeSynchronizer registered with queue_size=30, slop=0.5.")
-
-
-        # --- Publisher ---
-        self.fused_image_pub = self.create_publisher(Image, self.output_image_topic, 10)
-
-        # --- Camera Intrinsics ---
-        self.K = None
-        self.D = None
-        self.image_width = 0
-        self.image_height = 0
-
-        # --- BEV Parameters ---
-        # ... (BEV params as before) ...
-        self.bev_resolution = 0.05
-        self.bev_display_range_m = 20.0
-        self.bev_img_width_px = int(self.bev_display_range_m / self.bev_resolution)
-        self.bev_img_height_px = int(self.bev_display_range_m / self.bev_resolution)
-        self.bev_max_z_color = 2.0
-        self.bev_min_z_color = -0.5
-
-        # --- Threading Control ---
-        self.running = True
-        self.spin_thread = threading.Thread(target=self.ros_spin_thread_func)
-        # self.spin_thread.daemon = True # Optional: thread exits when main thread exits
-        self.spin_thread.start()
-
-        self.get_logger().info(f"LidarCameraFuser node initialized. OpenCV version: {cv2.__version__}")
-        self.get_logger().info(f"Topics: Image='{image_topic}', CamInfo='{camera_info_topic}', Lidar='{lidar_topic}'")
-        self.get_logger().info(f"Frames: CameraOptical='{self.camera_optical_frame}', LidarOptical='{self.lidar_optical_frame}'")
-
-    # --- DEBUGGING CALLBACKS ---
-    def image_debug_callback(self, msg):
-        self.get_logger().info(f"DEBUG: Received Image message on '{msg.header.frame_id}' (stamp: {msg.header.stamp.sec}.{msg.header.stamp.nanosec})", throttle_duration_sec=2.0)
-
-    def cam_info_debug_callback(self, msg):
-        self.get_logger().info(f"DEBUG: Received CameraInfo message on '{msg.header.frame_id}' (stamp: {msg.header.stamp.sec}.{msg.header.stamp.nanosec}) K[0]={msg.k[0]}", throttle_duration_sec=2.0)
-
-    def lidar_debug_callback(self, msg):
-        self.get_logger().info(f"DEBUG: Received PointCloud2 message on '{msg.header.frame_id}' (stamp: {msg.header.stamp.sec}.{msg.header.stamp.nanosec}, NumPoints approx: {msg.width * msg.height})", throttle_duration_sec=2.0)
-    # --- END DEBUGGING CALLBACKS ---
-
-    def ros_spin_thread_func(self):
-        self.get_logger().info("ROS Spin thread started.")
-        while rclpy.ok() and self.running:
-            try:
-                rclpy.spin_once(self, timeout_sec=0.1)
-            except Exception as e:
-                self.get_logger().error(f"Exception in ros_spin_thread_func: {e}\n{traceback.format_exc()}")
-        self.get_logger().info("ROS Spin thread finished.")
-
-
-    def create_lidar_bev_image(self, lidar_msg):
-        # ... (same as before) ...
-        bev_image = np.zeros((self.bev_img_height_px, self.bev_img_width_px, 3), dtype=np.uint8)
-        points_drawn = 0
-        for point in pc2.read_points(lidar_msg, field_names=("x", "y", "z"), skip_nans=True):
-            lx, ly, lz = point[0], point[1], point[2]
-            if abs(lx) > self.bev_display_range_m / 2 or abs(ly) > self.bev_display_range_m / 2:
-                continue
-            u_bev = int(self.bev_img_width_px / 2 - ly / self.bev_resolution)
-            v_bev = int(self.bev_img_height_px / 2 - lx / self.bev_resolution)
-            if 0 <= u_bev < self.bev_img_width_px and 0 <= v_bev < self.bev_img_height_px:
-                norm_z = np.clip((lz - self.bev_min_z_color) / (self.bev_max_z_color - self.bev_min_z_color), 0, 1)
-                blue = int(255 * (1 - norm_z))
-                red = int(255 * norm_z)
-                green = int(100 * norm_z * (1-norm_z) * 4)
-                cv2.circle(bev_image, (u_bev, v_bev), radius=1, color=(blue, green, red), thickness=-1)
-                points_drawn +=1
-        cv2.line(bev_image, (self.bev_img_width_px // 2, self.bev_img_height_px // 2), (self.bev_img_width_px // 2, self.bev_img_height_px // 2 - int(1.0/self.bev_resolution)), (0,255,0), 1)
-        cv2.line(bev_image, (self.bev_img_width_px // 2, self.bev_img_height_px // 2), (self.bev_img_width_px // 2 - int(1.0/self.bev_resolution), self.bev_img_height_px // 2), (0,0,255), 1)
-        return bev_image
-
-    def synchronized_callback(self, image_msg, camera_info_msg, lidar_msg):
-        self.get_logger().info(f"SYNC CALLBACK: Image ts={image_msg.header.stamp.sec}.{image_msg.header.stamp.nanosec}, CamInfo ts={camera_info_msg.header.stamp.sec}.{camera_info_msg.header.stamp.nanosec}, Lidar ts={lidar_msg.header.stamp.sec}.{lidar_msg.header.stamp.nanosec}")
+    def image_cb(self, msg: Image):
         try:
-            # 1. Store Camera Intrinsics
-            if self.K is None or self.image_width != camera_info_msg.width or self.K[0] != camera_info_msg.k[0]: # Check if K changed
-                self.K = np.array(camera_info_msg.k).reshape((3, 3))
-                self.D = np.array(camera_info_msg.d)
-                self.image_width = camera_info_msg.width
-                self.image_height = camera_info_msg.height
-                if self.K[0,0] == 0.0:
-                    self.get_logger().warn(f"Cam intrinsics (fx) is zero. K={self.K}.", throttle_duration_sec=10)
-                    return # Critical error
-                self.get_logger().info(f"Cam intrinsics updated: W={self.image_width}, H={self.image_height}, K[0,0]={self.K[0,0]:.2f}")
+            img = self.bridge_.imgmsg_to_cv2(msg, 'bgr8')
+            if img.shape[1] != self.img_w_param or img.shape[0] != self.img_h_param:
+                self.latest_image_ = cv2.resize(img, (self.img_w_param, self.img_h_param))
+            else: self.latest_image_ = img
+        except CvBridgeError as e: self.get_logger().error(f'Image conversion error: {e}')
 
-            # 2. Convert ROS Image to OpenCV image
-            cv_raw_image = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
-            self.get_logger().debug("Raw image converted to CV.")
+    def pc_cb(self, msg: PointCloud2): self.latest_pc_ = msg
 
-            # 3. Create LiDAR BEV Image
-            bev_image = self.create_lidar_bev_image(lidar_msg)
-            self.get_logger().debug("BEV image created.")
+    def crop_and_segment(self, img_to_process):
+        roi_content = img_to_process[self.roi_y_start:self.roi_y_end, self.roi_x_start:self.roi_x_end]
+        segmentation_mask_in_roi = None
+        if self.enable_seg_param_ and roi_content.size > 0:
+            hsv_roi = cv2.cvtColor(roi_content, cv2.COLOR_BGR2HSV)
+            lower_hsv = np.array([self.h_min, self.s_min, self.v_min])
+            upper_hsv = np.array([self.h_max, self.s_max, self.v_max])
+            segmentation_mask_in_roi = cv2.inRange(hsv_roi, lower_hsv, upper_hsv)
+        return roi_content, segmentation_mask_in_roi, (self.roi_x_start, self.roi_y_start)
 
-            # 4. Fusion
-            cv_fused_image = cv_raw_image.copy()
-            source_frame = lidar_msg.header.frame_id
-            target_frame = self.camera_optical_frame
-            transform_stamped = self.tf_buffer.lookup_transform(
-                target_frame, source_frame, lidar_msg.header.stamp, timeout=Duration(seconds=0.1)
-            )
-            self.get_logger().debug(f"TF lookup successful from {source_frame} to {target_frame}.")
-            
-            # ... (Projection logic as before, with some debug logs) ...
-            projected_points_for_drawing = []
-            points_processed = 0
-            for point_idx, point_data in enumerate(pc2.read_points(lidar_msg, field_names=("x", "y", "z"), skip_nans=True)):
-                points_processed += 1
-                lidar_point_stamped = PointStamped()
-                lidar_point_stamped.header.frame_id = source_frame
-                lidar_point_stamped.header.stamp = lidar_msg.header.stamp
-                lidar_point_stamped.point.x = float(point_data[0])
-                lidar_point_stamped.point.y = float(point_data[1])
-                lidar_point_stamped.point.z = float(point_data[2])
-                
-                camera_point_stamped = tf2_geometry_msgs.do_transform_point(lidar_point_stamped, transform_stamped)
-                
-                Xc, Yc, Zc = camera_point_stamped.point.x, camera_point_stamped.point.y, camera_point_stamped.point.z
-                if Zc <= 0.1: continue
-                if self.K is not None and self.K[0,0] != 0.0:
-                    u_raw = (self.K[0,0] * Xc / Zc) + self.K[0,2]
-                    v_raw = (self.K[1,1] * Yc / Zc) + self.K[1,2]
-                    if 0 <= u_raw < self.image_width and 0 <= v_raw < self.image_height:
-                        projected_points_for_drawing.append(((int(u_raw), int(v_raw)), Zc))
-            self.get_logger().debug(f"Processed {points_processed} lidar points, {len(projected_points_for_drawing)} projected.")
-            
-            min_depth_viz, max_depth_viz = 0.3, 15.0
-            for (u, v), depth in projected_points_for_drawing:
-                norm_depth = np.clip((depth - min_depth_viz) / (max_depth_viz - min_depth_viz), 0, 1)
-                blue = int(255 * (1 - norm_depth)); red = int(255 * norm_depth); green = int(120 * (1-abs(2*norm_depth - 1)))
-                cv2.circle(cv_fused_image, (u, v), radius=2, color=(blue, green, red), thickness=-1)
-            self.get_logger().debug("Drawing projected points done.")
-
-
-            # 5. Update shared data for GUI thread
-            with self.data_lock:
-                self.latest_raw_cv_image = cv_raw_image
-                self.latest_bev_cv_image = bev_image
-                self.latest_fused_cv_image = cv_fused_image
-            self.get_logger().info("SYNC CALLBACK: Updated shared images for GUI.") # More prominent log
-
-            # 6. Publish Fused Image Topic
-            fused_image_msg = self.bridge.cv2_to_imgmsg(cv_fused_image, "bgr8")
-            fused_image_msg.header = image_msg.header
-            self.fused_image_pub.publish(fused_image_msg)
-            self.get_logger().debug("Published fused image to topic.")
-
-        except CvBridgeError as e_cv:
-            self.get_logger().error(f"SYNC CALLBACK ERROR (CvBridge): {e_cv}\n{traceback.format_exc()}")
-        except (LookupException, ConnectivityException, ExtrapolationException) as e_tf:
-            self.get_logger().warn(f"SYNC CALLBACK ERROR (TF): {e_tf}", throttle_duration_sec=2.0)
-            # If TF fails, still update raw and bev for display
-            with self.data_lock:
-                if 'cv_raw_image' in locals(): self.latest_raw_cv_image = cv_raw_image
-                if 'bev_image' in locals(): self.latest_bev_cv_image = bev_image
-                self.latest_fused_cv_image = None # Indicate fusion failed
-            self.get_logger().info("SYNC CALLBACK: Updated raw/bev images after TF error.")
+    def _get_static_transform_lidar_to_cam(self):
+        try:
+            transform_stamped = self.tf_buffer_.lookup_transform(
+                self.camera_optical_frame_, self.lidar_optical_frame_, RclpyTime(),
+                timeout=RclpyDuration(seconds=self.tf_timeout_sec_))
+            q = transform_stamped.transform.rotation; t = transform_stamped.transform.translation
+            T_mat = tf_transformations.quaternion_matrix([q.x, q.y, q.z, q.w])
+            T_mat[:3, 3] = [t.x, t.y, t.z]
+            self.static_transform_lidar_to_cam_ = T_mat
         except Exception as e:
-            self.get_logger().error(f"SYNC CALLBACK ERROR (General): {e}\n{traceback.format_exc()}")
-
-
-    def run_gui_loop(self):
-        self.get_logger().info("GUI display loop started in main thread.")
-        
-        cv2.namedWindow(self.cv_raw_camera_window_name, cv2.WINDOW_AUTOSIZE)
-        cv2.namedWindow(self.cv_lidar_bev_window_name, cv2.WINDOW_AUTOSIZE)
-        cv2.namedWindow(self.cv_fused_window_name, cv2.WINDOW_AUTOSIZE)
-        self.get_logger().info("OpenCV windows created by GUI thread.")
-
-        # Create dummy black images for initial display if nothing received yet
-        dummy_img = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(dummy_img, "Waiting for data...", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        
-        local_raw_img, local_bev_img, local_fused_img = dummy_img.copy(), dummy_img.copy(), dummy_img.copy()
-
-        last_gui_update_time = time.time()
-
-        while rclpy.ok() and self.running:
-            data_updated_in_gui = False
-            with self.data_lock:
-                if self.latest_raw_cv_image is not None:
-                    local_raw_img = self.latest_raw_cv_image.copy()
-                    self.latest_raw_cv_image = None # Consume it
-                    data_updated_in_gui = True
-                if self.latest_bev_cv_image is not None:
-                    local_bev_img = self.latest_bev_cv_image.copy()
-                    self.latest_bev_cv_image = None # Consume it
-                    data_updated_in_gui = True
-                if self.latest_fused_cv_image is not None:
-                    local_fused_img = self.latest_fused_cv_image.copy()
-                    self.latest_fused_cv_image = None # Consume it
-                    data_updated_in_gui = True
+            self.get_logger().warn(f"TF Fail (Lidar->Cam): {e}. Will retry.", throttle_duration_sec=5.0)
+            self.static_transform_lidar_to_cam_ = None
             
-            if data_updated_in_gui:
-                self.get_logger().info("GUI Loop: Copied new images from shared data.")
-                last_gui_update_time = time.time()
+    def process_lidar_and_image_data(self, base_image_for_viz, segmentation_mask_roi, roi_top_left_offset):
+        points_for_viz_cloud = []; points_on_target_lidar_coords = []
+        if self.latest_pc_ is None or self.static_transform_lidar_to_cam_ is None:
+            return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-            # Always show something, even if it's the old image or dummy
-            cv2.imshow(self.cv_raw_camera_window_name, local_raw_img)
-            cv2.imshow(self.cv_lidar_bev_window_name, local_bev_img)
-            cv2.imshow(self.cv_fused_window_name, local_fused_img)
+        pts_raw_from_msg = pc2.read_points_numpy(self.latest_pc_, field_names=('x','y','z'), skip_nans=True)
+        if pts_raw_from_msg.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-            if time.time() - last_gui_update_time > 5.0: # If no update for 5s
-                self.get_logger().warn("GUI Loop: No new image data received for 5 seconds.", throttle_duration_sec=5.0)
+        pts_lidar_frame = np.vstack((pts_raw_from_msg['x'], pts_raw_from_msg['y'], pts_raw_from_msg['z'])).T.astype(np.float32) \
+            if pts_raw_from_msg.dtype.names else pts_raw_from_msg.reshape(-1,3).astype(np.float32)
+        pts_lidar_frame = pts_lidar_frame[np.isfinite(pts_lidar_frame).all(axis=1)]
+        if pts_lidar_frame.shape[0] == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-
-            key = cv2.waitKey(30)
-            if key != -1 and (key & 0xFF == ord('q')):
-                self.get_logger().info("Quit key 'q' pressed.")
-                self.running = False
-                break
+        pts_h_lidar = np.hstack((pts_lidar_frame, np.ones((pts_lidar_frame.shape[0], 1))))
+        pts_in_cam_optical_frame = (self.static_transform_lidar_to_cam_ @ pts_h_lidar.T).T[:, :3]
         
-        self.get_logger().info("GUI display loop ended.")
-        self.stop()
+        Z_depth_proj = pts_in_cam_optical_frame[:,0]; X_px_val = -pts_in_cam_optical_frame[:,1]; Y_px_val = -pts_in_cam_optical_frame[:,2]
+        valid_depth_mask = Z_depth_proj > 0.01
+        X_px_val_vd, Y_px_val_vd, Z_depth_proj_vd = X_px_val[valid_depth_mask], Y_px_val[valid_depth_mask], Z_depth_proj[valid_depth_mask]
+        original_pts_lidar_frame_vd = pts_lidar_frame[valid_depth_mask]
+        if X_px_val_vd.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-    def stop(self):
-        self.get_logger().info("Stop method called.")
-        if not self.running: # Already stopping/stopped
-            self.get_logger().info("Stop method: Already in stopping state.")
-            # Ensure spin_thread is handled if it wasn't joined yet
-            if hasattr(self, 'spin_thread') and self.spin_thread.is_alive():
-                self.get_logger().info("Stop method: Spin thread still alive, attempting join.")
-                self.spin_thread.join(timeout=0.5) # Short timeout as it should have exited
-                if self.spin_thread.is_alive():
-                    self.get_logger().warn("Stop method: Spin thread did not join after additional attempt.")
-            cv2.destroyAllWindows()
-            self.get_logger().info("Stop method: OpenCV windows destroyed (again, to be sure).")
+        u_img_coords = (self.fx_ * X_px_val_vd / Z_depth_proj_vd + self.cx_).astype(int)
+        v_img_coords = (self.fy_ * Y_px_val_vd / Z_depth_proj_vd + self.cy_).astype(int)
+        valid_proj_mask = (u_img_coords >= 0) & (u_img_coords < self.img_w_param) & (v_img_coords >= 0) & (v_img_coords < self.img_h_param)
+        u_img_coords_valid, v_img_coords_valid = u_img_coords[valid_proj_mask], v_img_coords[valid_proj_mask]
+        pts_lidar_for_valid_pixels = original_pts_lidar_frame_vd[valid_proj_mask]
+        
+        distances_from_lidar_origin = np.linalg.norm(pts_lidar_for_valid_pixels, axis=1)
+        norm_dist_colorize = np.clip((distances_from_lidar_origin - self.min_dist_colorize_) / (self.max_dist_colorize_ - self.min_dist_colorize_), 0, 1)
+        intensity_colorize = ((1.0 - norm_dist_colorize) * 255).astype(np.uint8)
+        colors_for_viz = cv2.applyColorMap(intensity_colorize.reshape(-1,1), self.colormap_viz_).reshape(-1,3)
+        if u_img_coords_valid.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
+
+        fused_image_display = base_image_for_viz.copy()
+        for idx in range(len(u_img_coords_valid)):
+            full_img_u, full_img_v = u_img_coords_valid[idx], v_img_coords_valid[idx]
+            roi_relative_u, roi_relative_v = full_img_u - roi_top_left_offset[0], full_img_v - roi_top_left_offset[1]
+            current_3d_point_in_lidar_frame = list(pts_lidar_for_valid_pixels[idx])
+            is_on_segmented_target = self.enable_seg_param_ and segmentation_mask_roi is not None and \
+                                     0 <= roi_relative_v < segmentation_mask_roi.shape[0] and \
+                                     0 <= roi_relative_u < segmentation_mask_roi.shape[1] and \
+                                     segmentation_mask_roi[roi_relative_v, roi_relative_u] > 0
+            if is_on_segmented_target:
+                points_for_viz_cloud.append(current_3d_point_in_lidar_frame)
+                if self.process_and_publish_target_: points_on_target_lidar_coords.append(current_3d_point_in_lidar_frame)
+
+            point_color_for_viz = tuple(map(int, colors_for_viz[idx]))
+            if self.point_display_mode_ == 2 or (self.point_display_mode_ == 1 and is_on_segmented_target):
+                if is_on_segmented_target and self.point_display_mode_ == 2: point_color_for_viz = (0,0,255) # Highlight red if all shown
+                elif is_on_segmented_target and self.point_display_mode_ == 1: point_color_for_viz = (0,0,255) # Red for selected only
+                if self.output_window_: cv2.circle(fused_image_display, (full_img_u, full_img_v), self.point_radius_viz_, point_color_for_viz, -1)
+        return fused_image_display, points_for_viz_cloud, points_on_target_lidar_coords
+
+    def calculate_and_publish_corrected_goal(self, points_on_target_lidar_frame: list, original_pc_header: Header):
+        self.get_logger().info(f"FINAL CORRECTED GOAL (map frame): X={corrected_goal_pose.pose.position.x:.3f}, Y={corrected_goal_pose.pose.position.y:.3f}, Z={corrected_goal_pose.pose.position.z:.3f}")
+        self.corrected_goal_publisher_.publish(corrected_goal_pose)
+        if not self.process_and_publish_target_: return
+
+        if not points_on_target_lidar_frame:
+            self._publish_invalid_goal("No target points found to calculate corrected goal.")
             return
 
-        self.running = False
-        self.get_logger().info("Stop method: self.running set to False.")
-
-        if hasattr(self, 'spin_thread') and self.spin_thread.is_alive():
-            self.get_logger().info("Stop method: Joining spin thread...")
-            self.spin_thread.join(timeout=1.0)
-            if self.spin_thread.is_alive():
-                self.get_logger().warn("Stop method: Spin thread did not join in time!")
-            else:
-                self.get_logger().info("Stop method: Spin thread joined successfully.")
-        else:
-            self.get_logger().info("Stop method: Spin thread not active or doesn't exist.")
+        target_points_np_lidar = np.array(points_on_target_lidar_frame, dtype=np.float32)
+        if target_points_np_lidar.shape[0] == 0:
+            self._publish_invalid_goal("Converted target points array is empty.")
+            return
             
-        cv2.destroyAllWindows()
-        self.get_logger().info("Stop method: OpenCV windows destroyed.")
+        centroid_lidar_frame = np.mean(target_points_np_lidar, axis=0)
+        pt_stamped_lidar = PointStamped(header=original_pc_header, point=Point(x=float(centroid_lidar_frame[0]), y=float(centroid_lidar_frame[1]), z=float(centroid_lidar_frame[2])))
 
+        try:
+            tf_stamp_to_use = pt_stamped_lidar.header.stamp
+            if tf_stamp_to_use.sec == 0 and tf_stamp_to_use.nanosec == 0:
+                 tf_stamp_to_use = RclpyTime() # Use rclpy.time.Time() which defaults to node's clock
+                 self.get_logger().warn(f"Lidar PC header stamp was zero, using current time for TF: {tf_stamp_to_use.nanoseconds}")
+
+
+            transform_to_nav_frame = self.tf_buffer_.lookup_transform(
+                self.navigation_frame_, pt_stamped_lidar.header.frame_id,
+                tf_stamp_to_use, timeout=RclpyDuration(seconds=0.5))
+            
+            pt_stamped_nav_frame = do_transform_point(pt_stamped_lidar, transform_to_nav_frame)
+            corrected_goal_pose = GeometryPoseStamped(header=Header(stamp=self.get_clock().now().to_msg(), frame_id=self.navigation_frame_))
+            corrected_goal_pose.pose.position = pt_stamped_nav_frame.point
+            q_identity = tf_transformations.quaternion_from_euler(0,0,0) 
+            corrected_goal_pose.pose.orientation = Quaternion(x=q_identity[0],y=q_identity[1],z=q_identity[2],w=q_identity[3])
+            self.corrected_goal_publisher_.publish(corrected_goal_pose)
+            self.get_logger().info(f"Published corrected local goal in '{self.navigation_frame_}': P({corrected_goal_pose.pose.position.x:.2f}, {corrected_goal_pose.pose.position.y:.2f})")
+        except Exception as ex:
+            self.get_logger().warn(f"TF/GoalPub Error: {ex}", throttle_duration_sec=2.0)
+            self._publish_invalid_goal(f"TF Error: {ex}")
+
+    def timer_cb(self):
+        if self.latest_image_ is None: return
+        if self.static_transform_lidar_to_cam_ is None:
+            self._get_static_transform_lidar_to_cam()
+            if self.static_transform_lidar_to_cam_ is None:
+                if self.output_window_: cv2.imshow(self.output_window_, cv2.resize(self.latest_image_.copy(), (800,600)))
+                return
+
+        _, segmentation_mask_in_roi, roi_top_left_offset = self.crop_and_segment(self.latest_image_)
+        segmentation_found_target = self.enable_seg_param_ and segmentation_mask_in_roi is not None and cv2.countNonZero(segmentation_mask_in_roi) > 0
+        image_for_visualization = self.latest_image_.copy()
+        points_for_viz_topic, points_on_target_for_goal_calc = [], []
+
+        if self.latest_pc_ is not None:
+            image_for_visualization, points_for_viz_topic, points_on_target_for_goal_calc = \
+                self.process_lidar_and_image_data(self.latest_image_, segmentation_mask_in_roi, roi_top_left_offset)
+        
+        if self.enable_seg_param_ and points_for_viz_topic and self.latest_pc_:
+            selected_cloud_msg = pc2.create_cloud_xyz32(self.latest_pc_.header, points_for_viz_topic)
+            self.selected_points_publisher_.publish(selected_cloud_msg)
+
+        if self.process_and_publish_target_:
+            if points_on_target_for_goal_calc and self.latest_pc_:
+                self.calculate_and_publish_corrected_goal(points_on_target_for_goal_calc, self.latest_pc_.header)
+            else: 
+                self._publish_invalid_goal("No target points for goal in current frame while active.")
+
+        if self.output_window_:
+            if self.enable_seg_param_:
+                roi_color = (0, 255, 0) if segmentation_found_target else (255, 191, 0)
+                cv2.rectangle(image_for_visualization, (self.roi_x_start, self.roi_y_start), (self.roi_x_end - 1, self.roi_y_end - 1), roi_color, 1)
+            cv2.imshow(self.output_window_, cv2.resize(image_for_visualization, (800,600)))
+            if cv2.waitKey(1) & 0xFF == ord('q'): self.destroy_node(); rclpy.shutdown()
+
+    def destroy_node(self):
+        self.get_logger().info("Destroying ROILidarFusionNode.")
+        if self.output_window_: cv2.destroyAllWindows()
+        super().destroy_node()
 
 def main(args=None):
-    # print(f"OpenCV version: {cv2.__version__}") # Already in init
     rclpy.init(args=args)
-    fuser_node = None
-    try:
-        fuser_node = LidarCameraFuser()
-        fuser_node.run_gui_loop()
-    except KeyboardInterrupt:
-        print('Keyboard interrupt received by main.')
-        if fuser_node: fuser_node.get_logger().info('Keyboard interrupt in main.')
-    except Exception as e:
-        print(f"Unhandled exception in main: {e}\n{traceback.format_exc()}")
-        if fuser_node: fuser_node.get_logger().error(f"Unhandled exception in main: {e}\n{traceback.format_exc()}")
+    node = None
+    try: node = ROILidarFusionNode(); rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    except Exception as e: node.get_logger().error(f"Unhandled exception: {e}\n{traceback.format_exc()}") if node else print(f"Exc: {e}")
     finally:
-        print("Main finally block entered.")
-        if fuser_node:
-            print("Calling fuser_node.stop() from main finally.")
-            fuser_node.stop()
-            print("Calling fuser_node.destroy_node() from main finally.")
-            fuser_node.destroy_node()
-            print("fuser_node destroyed.")
-        if rclpy.ok():
-            print("Calling rclpy.shutdown() from main finally.")
-            rclpy.shutdown()
-            print("rclpy shutdown.")
-        print("Main finally block finished.")
+        if node and rclpy.ok(): node.destroy_node()
+        if rclpy.ok(): rclpy.shutdown()
+        if hasattr(node, 'output_window_') and node.output_window_: cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
