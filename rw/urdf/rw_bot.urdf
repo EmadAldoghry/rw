@@ -306,7 +306,7 @@
     <joint name="front_camera_optical_joint" type="fixed">
         <parent link="front_camera_link"/>
         <child link="front_camera_link_optical"/>
-        <origin xyz="0.0202968 0 0.0228071" rpy="${pi} -${pi} -${pi}"/>
+        <origin xyz="0.0202968 0 0.0228071" rpy="0.0 0.0 0.0"/>
     </joint>
 
     <gazebo reference="front_camera_link_optical">
@@ -327,12 +327,12 @@
         <update_rate>20</update_rate>
         <visualize>true</visualize>
         <topic>camera</topic>
-        <gz_frame_id>front_camera_link</gz_frame_id>
+        <gz_frame_id>front_camera_link_optical</gz_frame_id>
         </sensor>
     </gazebo>
 
     <!-- Front LIDAR -->
-    <link name="laser_frame">
+    <link name="front_laser_frame">
         <visual>
             <geometry>
                 <mesh filename="file://$(find rw)/robot_meshes/front_lidar.stl" />
@@ -349,24 +349,24 @@
 
     <joint name="laser_joint" type="fixed">
         <parent link="panAndTile_kit"/>
-        <child link="laser_frame"/>
+        <child link="front_laser_frame"/>
         <origin xyz="0.0 0.0 0.0556141" rpy="0 0 0"/>
     </joint>
 
-    <link name="lidar_link_optical"></link>
+    <link name="front_lidar_link_optical"></link>
 
     <joint name="lidar_optical_joint" type="fixed">
-        <parent link="laser_frame"/>
-        <child link="lidar_link_optical"/>
-        <origin xyz="0.025 0 0.03" rpy="${pi} -${pi} -${pi}"/>
+        <parent link="front_laser_frame"/>
+        <child link="front_lidar_link_optical"/>
+        <origin xyz="0.025 0 0.03" rpy="0.0 0.0 0.0"/> 
     </joint>
 
-    <gazebo reference="lidar_link_optical">
+    <gazebo reference="front_lidar_link_optical">
 
         <sensor name="gpu_lidar" type="gpu_lidar">
             <update_rate>10</update_rate>
             <topic>scan_02</topic>
-            <gz_frame_id>lidar_link_optical</gz_frame_id>
+            <gz_frame_id>front_lidar_link_optical</gz_frame_id>
             <lidar>
                 <scan>
                 <horizontal>
@@ -393,7 +393,7 @@
                     <mean>0.0</mean>
                     <stddev>0.01</stddev>
                 </noise>
-                <frame_id>lidar_link_optical</frame_id>
+                <frame_id>front_lidar_link_optical</frame_id>
             </lidar>
             <always_on>1</always_on>
             <visualize>true</visualize>
@@ -547,7 +547,7 @@
             <topic>joint_states</topic>
             <joint_name>wheel_left_joint</joint_name>
             <joint_name>wheel_right_joint</joint_name>
-            <joint_name>panAndTile_kit_joint</joint_name>
+            <joint_name>panAndTile_kit_joint</joint_name> 
         </plugin>
 
     </gazebo>

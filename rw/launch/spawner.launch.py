@@ -167,12 +167,12 @@ def generate_launch_description():
         package="ros_gz_sim",
         executable="create",
         arguments=[
-            "-name", "mogi_bot",  # Name of the model in Gazebo
+            "-name", "rw_bot",  # Name of the model in Gazebo
             "-topic", "robot_description", # Use the robot_description topic
-            "-x", "1.51",
-            "-y", "2.44",
-            "-z", "1.61",
-            "-Y", "1.96"
+            "-x", "100.72",
+            "-y", "5.53",
+            "-z", "0.31",
+            "-Y", "-2.90"
         ],
         output="screen",
         parameters=[
@@ -227,18 +227,13 @@ def generate_launch_description():
     gz_image_bridge_node = Node(
         package="ros_gz_image",
         executable="image_bridge",
-        arguments=[
-            "/camera/image", # Bridge this specific image topic
-        ],
+        arguments=["/camera/image"], # Gz input topic
         output="screen",
-        parameters=[
-            {'use_sim_time': LaunchConfiguration('use_sim_time')},
-            # Optional: Configure compression
-            # 'camera.image.compressed.jpeg_quality': 75
-        ],
-        remappings=[ # Ensure image_transport topics are correctly mapped if needed
-            # ('/camera/image/compressed', '/my_topic/compressed'), # Example remapping
-        ]
+        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        # remappings=[
+        #     ("image", "camera/image"),       # ROS output image topic
+        #     ("camera_info", "camera/camera_info")  # ROS output CameraInfo topic
+        # ]
     )
 
     # Relay node to republish /camera/camera_info to enable image_transport pairing

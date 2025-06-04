@@ -2,28 +2,37 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Time
-from rclpy.duration import Duration
+from rclpy.time import Time as RclpyTime # Explicit import
+from rclpy.duration import Duration as RclpyDuration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+
 from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2 # For read_points_numpy and create_cloud_xyz32
+from std_msgs.msg import Header # For creating headers if needed
+from geometry_msgs.msg import PoseStamped as GeometryPoseStamped, PointStamped, Quaternion
+from sensor_msgs_py import point_cloud2 as pc2
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
 import math
 import tf2_ros
-import tf_transformations # For quaternion_matrix
-# from std_msgs.msg import Header # Not strictly needed if we copy and modify existing header
+from tf2_geometry_msgs import do_transform_point
+import tf_transformations
+import traceback
+
+from std_srvs.srv import SetBool # Standard service for activation
 
 class ROILidarFusionNode(Node):
     def __init__(self):
-        super().__init__('roi_lidar_fusion_node')
+        super().__init__('roi_lidar_fusion_node_activated') # Changed node name for clarity
+        
         # --- Parameters ---
         self.declare_parameter('input_image_topic', 'camera/image')
         self.declare_parameter('input_pc_topic', 'scan_02/points')
         self.declare_parameter('output_window', 'Fused View')
-        self.declare_parameter('output_selected_pc_topic', 'selected_lidar_points') # New parameter
+        self.declare_parameter('output_selected_pc_topic', 'selected_lidar_points')
+        self.declare_parameter('output_corrected_goal_topic', '/corrected_local_goal')
+        self.declare_parameter('navigation_frame', 'map')
 
-        # Declare image dimensions first, as their defaults are used for ROI default calculations
         self.declare_parameter('img_w', 1920)
         self.declare_parameter('img_h', 1200)
         self.img_w_param = self.get_parameter('img_w').get_parameter_value().integer_value
@@ -39,358 +48,394 @@ class ROILidarFusionNode(Node):
         self.declare_parameter('roi_x_end', default_roi_x_end)
         self.declare_parameter('roi_y_end', default_roi_y_end)
 
-        self.declare_parameter('enable_black_segmentation', True)
+        self.declare_parameter('enable_black_segmentation', True) # General toggle for segmentation logic
         for name, default in [('black_h_min', 0), ('black_s_min', 0), ('black_v_min', 0),
-                              ('black_h_max', 180), ('black_s_max', 255), ('black_v_max', 0)]:
+                              ('black_h_max', 180), ('black_s_max', 255), ('black_v_max', 50)]: # Adjusted v_max
             self.declare_parameter(name, default)
 
-        self.declare_parameter('point_display_mode', 2)
-        self.declare_parameter('hfov', 1.25)
-        self.declare_parameter('min_dist', 1.5)
-        self.declare_parameter('max_dist', 5.0)
-        self.declare_parameter('point_radius', 2)
-        self.declare_parameter('colormap', cv2.COLORMAP_JET)
-        self.declare_parameter('target_frame', 'front_camera_link_optical')
-        self.declare_parameter('source_frame', 'front_lidar_link_optical')
+        self.declare_parameter('point_display_mode', 2) # 0:None, 1:Selected, 2:All
+        self.declare_parameter('hfov', 1.25) # Horizontal Field of View for camera
+        self.declare_parameter('min_dist_colorize', 1.5) # Min distance for point cloud colorization
+        self.declare_parameter('max_dist_colorize', 5.0) # Max distance for point cloud colorization
+        self.declare_parameter('point_radius_viz', 2) # Radius for drawing points in visualization
+        self.declare_parameter('colormap_viz', cv2.COLORMAP_JET)
+        self.declare_parameter('camera_optical_frame', 'front_camera_link_optical') # TF frame for camera intrinsics
+        self.declare_parameter('lidar_optical_frame', 'front_lidar_link_optical')   # TF frame of incoming Lidar points
         self.declare_parameter('static_transform_lookup_timeout_sec', 5.0)
 
         # Get parameters
-        it = self.get_parameter('input_image_topic').get_parameter_value().string_value
-        pt = self.get_parameter('input_pc_topic').get_parameter_value().string_value
-        output_selected_pc_topic_name = self.get_parameter('output_selected_pc_topic').get_parameter_value().string_value
+        self.input_image_topic_ = self.get_parameter('input_image_topic').get_parameter_value().string_value
+        self.input_pc_topic_ = self.get_parameter('input_pc_topic').get_parameter_value().string_value
+        self.output_window_ = self.get_parameter('output_window').get_parameter_value().string_value
+        self.output_selected_pc_topic_ = self.get_parameter('output_selected_pc_topic').get_parameter_value().string_value
+        self.output_corrected_goal_topic_ = self.get_parameter('output_corrected_goal_topic').get_parameter_value().string_value
+        self.navigation_frame_ = self.get_parameter('navigation_frame').get_parameter_value().string_value
 
         self.roi_x_start = self.get_parameter('roi_x_start').get_parameter_value().integer_value
         self.roi_y_start = self.get_parameter('roi_y_start').get_parameter_value().integer_value
         self.roi_x_end = self.get_parameter('roi_x_end').get_parameter_value().integer_value
         self.roi_y_end = self.get_parameter('roi_y_end').get_parameter_value().integer_value
-
-        self.roi_x_start = max(0, self.roi_x_start)
-        self.roi_y_start = max(0, self.roi_y_start)
-        self.roi_x_end = min(self.img_w_param, self.roi_x_end)
-        self.roi_y_end = min(self.img_h_param, self.roi_y_end)
-
-        if not (self.roi_x_start < self.roi_x_end and self.roi_y_start < self.roi_y_end):
-            self.get_logger().error(
-                f"Invalid ROI coordinates after clamping or due to override: "
-                f"x_start={self.roi_x_start}, y_start={self.roi_y_start}, "
-                f"x_end={self.roi_x_end}, y_end={self.roi_y_end} "
-                f"for image {self.img_w_param}x{self.img_h_param}. "
-                f"Defaulting ROI to full image."
-            )
-            self.roi_x_start = 0; self.roi_y_start = 0
-            self.roi_x_end = self.img_w_param; self.roi_y_end = self.img_h_param
-        self.get_logger().info(f"Using ROI: x=[{self.roi_x_start},{self.roi_x_end}), y=[{self.roi_y_start},{self.roi_y_end}) on {self.img_w_param}x{self.img_h_param} image")
-
-        self.enable_seg = self.get_parameter('enable_black_segmentation').get_parameter_value().bool_value
+        self.enable_seg_param_ = self.get_parameter('enable_black_segmentation').get_parameter_value().bool_value
         self.h_min = self.get_parameter('black_h_min').get_parameter_value().integer_value
         self.s_min = self.get_parameter('black_s_min').get_parameter_value().integer_value
         self.v_min = self.get_parameter('black_v_min').get_parameter_value().integer_value
         self.h_max = self.get_parameter('black_h_max').get_parameter_value().integer_value
         self.s_max = self.get_parameter('black_s_max').get_parameter_value().integer_value
         self.v_max = self.get_parameter('black_v_max').get_parameter_value().integer_value
+        self.point_display_mode_ = self.get_parameter('point_display_mode').get_parameter_value().integer_value
+        self.hfov_ = self.get_parameter('hfov').get_parameter_value().double_value
+        self.min_dist_colorize_ = self.get_parameter('min_dist_colorize').get_parameter_value().double_value
+        self.max_dist_colorize_ = self.get_parameter('max_dist_colorize').get_parameter_value().double_value
+        self.point_radius_viz_ = self.get_parameter('point_radius_viz').get_parameter_value().integer_value
+        self.colormap_viz_ = self.get_parameter('colormap_viz').get_parameter_value().integer_value
+        self.camera_optical_frame_ = self.get_parameter('camera_optical_frame').get_parameter_value().string_value
+        self.lidar_optical_frame_ = self.get_parameter('lidar_optical_frame').get_parameter_value().string_value
+        self.tf_timeout_sec_ = self.get_parameter('static_transform_lookup_timeout_sec').get_parameter_value().double_value
 
-        self.point_display_mode = self.get_parameter('point_display_mode').get_parameter_value().integer_value
-        if self.point_display_mode not in [0, 1, 2]:
-            self.get_logger().warn(f"Invalid point_display_mode: {self.point_display_mode}. Defaulting to 2 (All Projected).")
-            self.point_display_mode = 2
-        self.get_logger().info(f"Point display mode: {self.point_display_mode} (0:None, 1:Selected, 2:All)")
+        # Validate and clamp ROI
+        self.roi_x_start = max(0, self.roi_x_start)
+        self.roi_y_start = max(0, self.roi_y_start)
+        self.roi_x_end = min(self.img_w_param, self.roi_x_end)
+        self.roi_y_end = min(self.img_h_param, self.roi_y_end)
+        if not (self.roi_x_start < self.roi_x_end and self.roi_y_start < self.roi_y_end):
+            self.get_logger().error("Invalid ROI, defaulting to full image.")
+            self.roi_x_start, self.roi_y_start = 0, 0
+            self.roi_x_end, self.roi_y_end = self.img_w_param, self.img_h_param
+        self.get_logger().info(f"Using ROI: x=[{self.roi_x_start},{self.roi_x_end}), y=[{self.roi_y_start},{self.roi_y_end})")
 
-        hfov = self.get_parameter('hfov').get_parameter_value().double_value
-        self.min_dist = self.get_parameter('min_dist').get_parameter_value().double_value
-        self.max_dist = self.get_parameter('max_dist').get_parameter_value().double_value
-        self.point_radius = self.get_parameter('point_radius').get_parameter_value().integer_value
-        self.colormap = self.get_parameter('colormap').get_parameter_value().integer_value
-        self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
-        self.source_frame = self.get_parameter('source_frame').get_parameter_value().string_value
-        self.static_transform_lookup_timeout_sec = self.get_parameter('static_transform_lookup_timeout_sec').get_parameter_value().double_value
+        # Camera intrinsics based on parameters
+        self.fx_ = self.img_w_param / (2 * math.tan(self.hfov_ / 2.0))
+        self.fy_ = self.fx_ # Assuming square pixels
+        self.cx_ = self.img_w_param / 2.0
+        self.cy_ = self.img_h_param / 2.0
+        self.get_logger().info(f"Cam Intrinsics: fx={self.fx_:.2f}, fy={self.fy_:.2f}, cx={self.cx_:.2f}, cy={self.cy_:.2f}")
 
-        self.fx = self.img_w_param / (2 * math.tan(hfov/2))
-        self.fy = self.fx
-        self.cx = self.img_w_param / 2.0
-        self.cy = self.img_h_param / 2.0
-        self.get_logger().info(f"Camera Intrinsics (for {self.img_w_param}x{self.img_h_param} image): fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}")
+        self.bridge_ = CvBridge()
+        self.latest_image_ = None
+        self.latest_pc_ = None
+        self.tf_buffer_ = tf2_ros.Buffer()
+        self.tf_listener_ = tf2_ros.TransformListener(self.tf_buffer_, self)
+        self.static_transform_lidar_to_cam_ = None # Stores the numpy matrix
 
-        self.bridge = CvBridge()
-        self.latest_image = None
-        self.latest_pc = None
-        self.create_subscription(Image, it, self.image_cb, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
-        self.create_subscription(PointCloud2, pt, self.pc_cb, rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value)
+        if self.output_window_:
+            cv2.namedWindow(self.output_window_, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.output_window_, 800, 600)
 
-        # New publisher for selected points
-        self.selected_points_publisher = self.create_publisher(PointCloud2, output_selected_pc_topic_name, 10)
-        self.get_logger().info(f"Publishing selected LiDAR points to: {output_selected_pc_topic_name}")
+        # --- New state variable for activation ---
+        self.process_and_publish_target_ = False # Controlled by service, start as False
 
+        # Publishers
+        self.selected_points_publisher_ = self.create_publisher(PointCloud2, self.output_selected_pc_topic_, 10)
+        _qos_reliable_transient = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, 
+            depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.corrected_goal_publisher_ = self.create_publisher(
+            GeometryPoseStamped, self.output_corrected_goal_topic_, _qos_reliable_transient)
+        self.get_logger().info(f"Publishing corrected local goals to: {self.output_corrected_goal_topic_}")
 
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.static_transform_matrix = None
+        # Subscribers (using SENSOR_DATA QoS for potentially high-rate image/lidar)
+        qos_sensor = rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value
+        self.create_subscription(Image, self.input_image_topic_, self.image_cb, qos_sensor)
+        self.create_subscription(PointCloud2, self.input_pc_topic_, self.pc_cb, qos_sensor)
 
-        self.window = self.get_parameter('output_window').get_parameter_value().string_value
-        cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window, 800, 600)
+        # Service Server for activation
+        self.activation_service_ = self.create_service(
+            SetBool, '~/activate_segmentation', self.handle_activation_request)
+        self.get_logger().info(f"Activation service '~/activate_segmentation' is ready.")
 
-        self.create_timer(1.0/30.0, self.timer_cb)
-        self.get_logger().info('ROI-LiDAR Fusion Node started')
+        self.timer_ = self.create_timer(1.0 / 15.0, self.timer_cb) # Process at 15Hz
+        self.get_logger().info('ROI-LiDAR Fusion Node (with activation) started. Target processing INACTIVE.')
+
+    def handle_activation_request(self, request: SetBool.Request, response: SetBool.Response):
+        self.process_and_publish_target_ = request.data
+        if self.process_and_publish_target_:
+            response.message = "Target processing and goal publishing ACTIVATED."
+        else:
+            response.message = "Target processing and goal publishing DEACTIVATED."
+            # Publish an empty/invalid PoseStamped to signal no active target
+            empty_pose = GeometryPoseStamped()
+            empty_pose.header.stamp = self.get_clock().now().to_msg()
+            empty_pose.header.frame_id = "" # Explicitly empty or clearly invalid
+            self.corrected_goal_publisher_.publish(empty_pose)
+        self.get_logger().info(response.message)
+        response.success = True
+        return response
 
     def image_cb(self, msg: Image):
         try:
-            img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            img = self.bridge_.imgmsg_to_cv2(msg, 'bgr8')
+            # Resize if incoming image dimensions differ from configured ones
             if img.shape[1] != self.img_w_param or img.shape[0] != self.img_h_param:
-                self.latest_image = cv2.resize(img, (self.img_w_param, self.img_h_param))
+                self.latest_image_ = cv2.resize(img, (self.img_w_param, self.img_h_param))
             else:
-                self.latest_image = img
+                self.latest_image_ = img
         except CvBridgeError as e:
             self.get_logger().error(f'Image conversion error: {e}')
 
     def pc_cb(self, msg: PointCloud2):
-        self.latest_pc = msg
+        self.latest_pc_ = msg
 
-    def crop_and_segment(self, img):
-        roi = img[self.roi_y_start:self.roi_y_end, self.roi_x_start:self.roi_x_end]
-        segmentation_mask_roi = None
-        if self.enable_seg:
-            if roi.size == 0:
-                self.get_logger().warn("ROI is empty during crop_and_segment, cannot perform segmentation.")
-            else:
-                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                lower = np.array([self.h_min, self.s_min, self.v_min])
-                upper = np.array([self.h_max, self.s_max, self.v_max])
-                segmentation_mask_roi = cv2.inRange(hsv, lower, upper)
-        offset = (self.roi_x_start, self.roi_y_start)
-        return roi, segmentation_mask_roi, offset
+    def crop_and_segment(self, img_to_process):
+        # Assumes img_to_process is already at self.img_w_param x self.img_h_param
+        roi_content = img_to_process[self.roi_y_start:self.roi_y_end, self.roi_x_start:self.roi_x_end]
+        segmentation_mask_in_roi = None # Mask relative to ROI
+        if self.enable_seg_param_ and roi_content.size > 0:
+            hsv_roi = cv2.cvtColor(roi_content, cv2.COLOR_BGR2HSV)
+            lower_hsv = np.array([self.h_min, self.s_min, self.v_min])
+            upper_hsv = np.array([self.h_max, self.s_max, self.v_max])
+            segmentation_mask_in_roi = cv2.inRange(hsv_roi, lower_hsv, upper_hsv)
+        
+        # Offset of the ROI's top-left corner in the full image
+        roi_top_left_offset = (self.roi_x_start, self.roi_y_start)
+        return roi_content, segmentation_mask_in_roi, roi_top_left_offset
 
-    def _get_static_transform(self):
+    def _get_static_transform_lidar_to_cam(self):
         try:
-            transform_stamped = self.tf_buffer.lookup_transform(
-                self.target_frame, self.source_frame, Time(),
-                timeout=Duration(seconds=self.static_transform_lookup_timeout_sec)
+            transform_stamped = self.tf_buffer_.lookup_transform(
+                self.camera_optical_frame_, self.lidar_optical_frame_, RclpyTime(), # Get latest
+                timeout=RclpyDuration(seconds=self.tf_timeout_sec_)
             )
-            q = transform_stamped.transform.rotation; t = transform_stamped.transform.translation
+            q = transform_stamped.transform.rotation
+            t = transform_stamped.transform.translation
             T_mat = tf_transformations.quaternion_matrix([q.x, q.y, q.z, q.w])
             T_mat[:3, 3] = [t.x, t.y, t.z]
-            self.static_transform_matrix = T_mat
-            self.get_logger().info(f"Successfully fetched static transform from {self.source_frame} to {self.target_frame}")
+            self.static_transform_lidar_to_cam_ = T_mat
+            self.get_logger().debug(f"Fetched static transform from {self.lidar_optical_frame_} to {self.camera_optical_frame_}")
         except Exception as e:
-            self.get_logger().warn(f"Could not get static transform: {e}. Will retry.")
-            self.static_transform_matrix = None
-
-    def project_and_color(self, base_img, segmentation_mask_roi, roi_offset):
-        selected_points_for_publishing = [] # List to store [x,y,z] of selected points
-        
-        if self.latest_pc is None: return base_img, selected_points_for_publishing
-        if self.static_transform_matrix is None: return base_img, selected_points_for_publishing
-
-        pts_raw = point_cloud2.read_points_numpy(self.latest_pc, field_names=('x','y','z'), skip_nans=True)
-        if pts_raw.size == 0: return base_img, selected_points_for_publishing
-
-        # pts are in original LiDAR frame (self.source_frame)
-        pts = np.vstack((pts_raw['x'], pts_raw['y'], pts_raw['z'])).T if pts_raw.dtype.names else pts_raw.reshape(-1,3)
-        pts = pts[np.isfinite(pts).all(axis=1)]
-        if pts.shape[0] == 0: return base_img, selected_points_for_publishing
-
-        pts_h = np.hstack((pts, np.ones((pts.shape[0], 1))))
-        # cam_coords are in camera optical frame (self.target_frame)
-        cam_coords = (self.static_transform_matrix @ pts_h.T).T[:, :3]
-
-        # Standard camera projection: X right, Y down, Z forward
-        # LiDAR points might be X forward, Y left, Z up (ROS standard)
-        # Transformation to camera optical: X right, Y down, Z forward from camera perspective
-        # Assuming cam_coords[:,0] is X_cam, cam_coords[:,1] is Y_cam, cam_coords[:,2] is Z_cam (depth)
-        # If your camera is front_camera_link_optical (X right, Y down, Z forward):
-        # X_cam_proj = cam_coords[:,0]
-        # Y_cam_proj = cam_coords[:,1]
-        # Z_cam_depth = cam_coords[:,2]
-        # The original code had: X_cam_proj, Y_cam_proj, Z_cam_depth = -cam_coords[:,1], -cam_coords[:,2], cam_coords[:,0]
-        # This implies a coordinate system mismatch or a non-standard optical frame definition after transformation.
-        # Let's stick to the original projection logic as it was working for visualization.
-        # If front_lidar_link_optical is X right, Y down, Z forward (like a camera)
-        # and front_camera_link_optical is also X right, Y down, Z forward
-        # then cam_coords should be directly usable.
-        # The negation and swapping suggests cam_coords are not yet in the desired X-right, Y-down, Z-forward.
-        # E.g. if after transform, cam_coords are (X_lidar_in_cam_frame, Y_lidar_in_cam_frame, Z_lidar_in_cam_frame)
-        # and these correspond to (X_fwd, Y_left, Z_up) from camera's perspective, then:
-        # Z_cam_depth (true depth) = X_lidar_in_cam_frame  (cam_coords[:,0])
-        # X_cam_proj (image u-coord direction) = -Y_lidar_in_cam_frame (-cam_coords[:,1])
-        # Y_cam_proj (image v-coord direction) = -Z_lidar_in_cam_frame (-cam_coords[:,2])
-        X_cam_proj, Y_cam_proj, Z_cam_depth = -cam_coords[:,1], -cam_coords[:,2], cam_coords[:,0]
-
-        valid_depth_mask = Z_cam_depth > 0.01 # Points in front of camera
-        
-        X_cam_proj_vd = X_cam_proj[valid_depth_mask]
-        Y_cam_proj_vd = Y_cam_proj[valid_depth_mask]
-        Z_cam_depth_vd = Z_cam_depth[valid_depth_mask]
-        original_pts_after_depth_filter = pts[valid_depth_mask] # Original LiDAR coordinates for valid depth points
-
-        if X_cam_proj_vd.size == 0: return base_img, selected_points_for_publishing
-
-        distances = np.linalg.norm(original_pts_after_depth_filter, axis=1) # Distance from LiDAR origin
-        norm_dist = np.clip((distances - self.min_dist) / (self.max_dist - self.min_dist), 0, 1)
-        intensity = ((1.0 - norm_dist) * 255).astype(np.uint8)
-        colors_map = cv2.applyColorMap(intensity.reshape(-1, 1), self.colormap).reshape(-1, 3)
-
-        u_px = (self.fx * X_cam_proj_vd / Z_cam_depth_vd + self.cx).astype(int)
-        v_px = (self.fy * Y_cam_proj_vd / Z_cam_depth_vd + self.cy).astype(int)
-
-        # Filter points that project within image bounds
-        valid_proj_mask = (u_px >= 0) & (u_px < self.img_w_param) & \
-                          (v_px >= 0) & (v_px < self.img_h_param)
-        
-        u_px_valid = u_px[valid_proj_mask]
-        v_px_valid = v_px[valid_proj_mask]
-        colors_valid = colors_map[valid_proj_mask]
-        # These are the original LiDAR coordinates of points that project validly onto the image
-        original_pts_for_valid_pixels = original_pts_after_depth_filter[valid_proj_mask]
-
-        if u_px_valid.size == 0: return base_img, selected_points_for_publishing
-
-        fused_img = base_img.copy()
-        roi_x_abs_offset, roi_y_abs_offset = roi_offset
-
-        for idx in range(len(u_px_valid)):
-            img_u, img_v = u_px_valid[idx], v_px_valid[idx]
-            # Convert pixel coordinates to be relative to the ROI
-            roi_u, roi_v = img_u - roi_x_abs_offset, img_v - roi_y_abs_offset
+            self.get_logger().warn(f"TF Fail (Lidar->Cam): {e}. Will retry.")
+            self.static_transform_lidar_to_cam_ = None
             
-            current_original_3d_point = list(original_pts_for_valid_pixels[idx])
+    def process_lidar_and_image_data(self, base_image_for_viz, segmentation_mask_roi, roi_top_left_offset):
+        points_for_viz_cloud = [] # Points that fall in segmented region (for selected_lidar_points topic)
+        points_on_target_lidar_coords = [] # 3D points (in lidar frame) that are on the segmented target
 
+        if self.latest_pc_ is None or self.static_transform_lidar_to_cam_ is None:
+            return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-            is_in_segmented_region = False
-            if self.enable_seg and segmentation_mask_roi is not None and \
-               0 <= roi_v < segmentation_mask_roi.shape[0] and \
-               0 <= roi_u < segmentation_mask_roi.shape[1] and \
-               segmentation_mask_roi[roi_v, roi_u] > 0:
-                is_in_segmented_region = True
-                # This point is in the segmented region, collect its original 3D coordinates
-                selected_points_for_publishing.append(current_original_3d_point)
+        pts_raw_from_msg = pc2.read_points_numpy(self.latest_pc_, field_names=('x','y','z'), skip_nans=True)
+        if pts_raw_from_msg.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
+        # Ensure pts_lidar_frame is a simple Nx3 array of floats
+        if pts_raw_from_msg.dtype.names: # If it's a structured array
+            pts_lidar_frame = np.vstack((pts_raw_from_msg['x'], pts_raw_from_msg['y'], pts_raw_from_msg['z'])).T.astype(np.float32)
+        else: # If it's already a plain array (e.g., from some preprocessing)
+            pts_lidar_frame = pts_raw_from_msg.reshape(-1,3).astype(np.float32)
+        
+        pts_lidar_frame = pts_lidar_frame[np.isfinite(pts_lidar_frame).all(axis=1)]
+        if pts_lidar_frame.shape[0] == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
 
-            # Drawing logic for visualization
-            draw_this_point = False
-            point_color_to_draw = tuple(map(int, colors_valid[idx]))
+        # Transform points from lidar_optical_frame to camera_optical_frame
+        pts_h_lidar = np.hstack((pts_lidar_frame, np.ones((pts_lidar_frame.shape[0], 1))))
+        pts_in_cam_optical_frame = (self.static_transform_lidar_to_cam_ @ pts_h_lidar.T).T[:, :3]
 
-            if self.point_display_mode == 2: # Display all projected points
-                draw_this_point = True
-                if is_in_segmented_region: # If also in segmented region, color it red
-                    point_color_to_draw = (0, 0, 255) 
-            elif self.point_display_mode == 1: # Display only selected (segmented) points
-                if is_in_segmented_region:
-                    draw_this_point = True
-                    point_color_to_draw = (0, 0, 255) # Color selected points red
+        # Projection logic (adjust based on your actual camera_optical_frame definition relative to lidar_optical_frame)
+        # Common convention for camera_optical_frame: Z forward, X right, Y down
+        # If lidar_optical_frame is X forward, Y left, Z up, then after transform to camera_optical:
+        # Cam's Z (depth) = Lidar's X (if aligned)
+        # Cam's X (u-coord) = Lidar's -Y (if aligned)
+        # Cam's Y (v-coord) = Lidar's -Z (if aligned)
+        # Your original projection: X_cam_proj=-cam_coords[:,1], Y_cam_proj=-cam_coords[:,2], Z_cam_depth=cam_coords[:,0]
+        # This implies Z_depth_for_projection = pts_in_cam_optical_frame[:,0]
+        #             X_pixel_direction_val = -pts_in_cam_optical_frame[:,1]
+        #             Y_pixel_direction_val = -pts_in_cam_optical_frame[:,2]
+        
+        Z_depth_proj = pts_in_cam_optical_frame[:,0] 
+        X_px_val = -pts_in_cam_optical_frame[:,1]
+        Y_px_val = -pts_in_cam_optical_frame[:,2]
 
-            if draw_this_point:
-                for dx_p in range(-self.point_radius, self.point_radius + 1):
-                    for dy_p in range(-self.point_radius, self.point_radius + 1):
-                        draw_x = np.clip(img_u + dx_p, 0, self.img_w_param - 1)
-                        draw_y = np.clip(img_v + dy_p, 0, self.img_h_param - 1)
-                        fused_img[draw_y, draw_x] = point_color_to_draw
+        valid_depth_mask = Z_depth_proj > 0.01 # Points in front of camera
+        X_px_val_vd = X_px_val[valid_depth_mask]
+        Y_px_val_vd = Y_px_val[valid_depth_mask]
+        Z_depth_proj_vd = Z_depth_proj[valid_depth_mask]
+        original_pts_lidar_frame_vd = pts_lidar_frame[valid_depth_mask] # Keep original lidar coords
+
+        if X_px_val_vd.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
+
+        # Calculate pixel coordinates
+        u_img_coords = (self.fx_ * X_px_val_vd / Z_depth_proj_vd + self.cx_).astype(int)
+        v_img_coords = (self.fy_ * Y_px_val_vd / Z_depth_proj_vd + self.cy_).astype(int)
+
+        # Filter points that project within the full image bounds
+        valid_proj_mask = (u_img_coords >= 0) & (u_img_coords < self.img_w_param) & \
+                          (v_img_coords >= 0) & (v_img_coords < self.img_h_param)
+        
+        u_img_coords_valid = u_img_coords[valid_proj_mask]
+        v_img_coords_valid = v_img_coords[valid_proj_mask]
+        # Keep original lidar coordinates of points that project validly onto the full image
+        pts_lidar_for_valid_pixels = original_pts_lidar_frame_vd[valid_proj_mask]
+        
+        # --- Colorization for visualization ---
+        distances_from_lidar_origin = np.linalg.norm(pts_lidar_for_valid_pixels, axis=1)
+        norm_dist_colorize = np.clip((distances_from_lidar_origin - self.min_dist_colorize_) / \
+                                     (self.max_dist_colorize_ - self.min_dist_colorize_), 0, 1)
+        intensity_colorize = ((1.0 - norm_dist_colorize) * 255).astype(np.uint8) # Closer is hotter (red in JET)
+        colors_for_viz = cv2.applyColorMap(intensity_colorize.reshape(-1,1), self.colormap_viz_).reshape(-1,3)
+        # --- End Colorization ---
+
+        if u_img_coords_valid.size == 0: return base_image_for_viz, points_for_viz_cloud, points_on_target_lidar_coords
+
+        fused_image_display = base_image_for_viz.copy() # Image for drawing points on
+
+        for idx in range(len(u_img_coords_valid)):
+            full_img_u, full_img_v = u_img_coords_valid[idx], v_img_coords_valid[idx]
+            
+            # Coordinates relative to the ROI's top-left corner
+            roi_relative_u = full_img_u - roi_top_left_offset[0]
+            roi_relative_v = full_img_v - roi_top_left_offset[1]
+            
+            current_3d_point_in_lidar_frame = list(pts_lidar_for_valid_pixels[idx])
+
+            is_on_segmented_target = False
+            if self.enable_seg_param_ and segmentation_mask_roi is not None and \
+               0 <= roi_relative_v < segmentation_mask_roi.shape[0] and \
+               0 <= roi_relative_u < segmentation_mask_roi.shape[1] and \
+               segmentation_mask_roi[roi_relative_v, roi_relative_u] > 0:
+                is_on_segmented_target = True
+                points_for_viz_cloud.append(current_3d_point_in_lidar_frame)
+                if self.process_and_publish_target_: # Only collect for goal if master switch is on
+                    points_on_target_lidar_coords.append(current_3d_point_in_lidar_frame)
+
+            # Visualization drawing logic
+            draw_this_point_for_viz = False
+            point_color_for_viz = tuple(map(int, colors_for_viz[idx]))
+
+            if self.point_display_mode_ == 2: # Display all projected points
+                draw_this_point_for_viz = True
+                if is_on_segmented_target: point_color_for_viz = (0, 0, 255) # Highlight segmented points in red
+            elif self.point_display_mode_ == 1 and is_on_segmented_target: # Display only selected (segmented)
+                draw_this_point_for_viz = True
+                point_color_for_viz = (0, 0, 255) # Color selected points red
+
+            if draw_this_point_for_viz and self.output_window_:
+                cv2.circle(fused_image_display, (full_img_u, full_img_v), self.point_radius_viz_, point_color_for_viz, -1)
                         
-        return fused_img, selected_points_for_publishing
+        return fused_image_display, points_for_viz_cloud, points_on_target_lidar_coords
+
+    def calculate_and_publish_corrected_goal(self, points_on_target_lidar_frame: list, original_pc_header: Header):
+        if not self.process_and_publish_target_ or not points_on_target_lidar_frame:
+            return
+
+        target_points_np_lidar = np.array(points_on_target_lidar_frame, dtype=np.float32)
+        centroid_lidar_frame = np.mean(target_points_np_lidar, axis=0)
+
+        pt_stamped_lidar = PointStamped()
+        pt_stamped_lidar.header = original_pc_header # Use stamp and frame_id from source Lidar PC
+        pt_stamped_lidar.point.x = float(centroid_lidar_frame[0])
+        pt_stamped_lidar.point.y = float(centroid_lidar_frame[1])
+        pt_stamped_lidar.point.z = float(centroid_lidar_frame[2])
+
+        try:
+            transform_to_nav_frame = self.tf_buffer_.lookup_transform(
+                self.navigation_frame_, pt_stamped_lidar.header.frame_id,
+                pt_stamped_lidar.header.stamp if (pt_stamped_lidar.header.stamp.sec > 0 or pt_stamped_lidar.header.stamp.nanosec > 0) else RclpyTime(),
+                timeout=RclpyDuration(seconds=0.5)
+            )
+            pt_stamped_nav_frame = do_transform_point(pt_stamped_lidar, transform_to_nav_frame)
+
+            corrected_goal_pose = GeometryPoseStamped()
+            corrected_goal_pose.header.stamp = self.get_clock().now().to_msg()
+            corrected_goal_pose.header.frame_id = self.navigation_frame_
+            corrected_goal_pose.pose.position = pt_stamped_nav_frame.point
+            q_identity = tf_transformations.quaternion_from_euler(0,0,0) # Assuming target is on ground, orientation might not matter much for position
+            corrected_goal_pose.pose.orientation = Quaternion(x=q_identity[0],y=q_identity[1],z=q_identity[2],w=q_identity[3])
+            
+            self.corrected_goal_publisher_.publish(corrected_goal_pose)
+            self.get_logger().info(f"Published corrected local goal in '{self.navigation_frame_}': "
+                                   f"P({corrected_goal_pose.pose.position.x:.2f}, {corrected_goal_pose.pose.position.y:.2f})")
+        except Exception as ex:
+            self.get_logger().warn(f"TF/GoalPub Error: {ex}\n{traceback.format_exc()}", throttle_duration_sec=2.0)
 
     def timer_cb(self):
-        if self.latest_image is None: return
+        if self.latest_image_ is None: 
+            self.get_logger().debug("Timer CB: No latest image.", throttle_duration_sec=5.0)
+            return
 
-        if self.static_transform_matrix is None:
-            self._get_static_transform()
-            if self.static_transform_matrix is None:
-                self.get_logger().info("Waiting for static transform...")
-                display_img_resized = cv2.resize(self.latest_image, (800,600))
-                cv2.putText(display_img_resized, "Waiting for TF transform...", (50,50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-                cv2.imshow(self.window, display_img_resized)
-                cv2.waitKey(1)
+        if self.static_transform_lidar_to_cam_ is None:
+            self._get_static_transform_lidar_to_cam()
+            if self.static_transform_lidar_to_cam_ is None:
+                self.get_logger().warn("Timer CB: Waiting for Lidar->Cam TF. Skipping fusion.", throttle_duration_sec=2.0)
+                if self.output_window_: cv2.imshow(self.output_window_, cv2.resize(self.latest_image_.copy(), (800,600)))
                 return
 
-        # --- Image Processing ---
-        # roi_image_content is the cropped part of the image, segmentation_mask_for_roi is for that crop
-        roi_image_content, segmentation_mask_for_roi, roi_absolute_offset = self.crop_and_segment(self.latest_image)
-
-        segmentation_found_something = False
-        if self.enable_seg and segmentation_mask_for_roi is not None and cv2.countNonZero(segmentation_mask_for_roi) > 0:
-            segmentation_found_something = True
-
-        # --- Point Cloud Processing and Fusion ---
-        output_display_image = self.latest_image.copy()
+        # Perform cropping and segmentation on the latest image
+        _, segmentation_mask_in_roi, roi_top_left_offset = self.crop_and_segment(self.latest_image_)
         
-        if self.latest_pc is not None:
-            # project_and_color will draw points on output_display_image based on point_display_mode
-            # and will return points_to_publish (original 3D coords in LiDAR frame) if they fall in segmented area
-            processed_image_with_points, points_to_publish = self.project_and_color(
-                output_display_image, # Pass the current image to draw on
-                segmentation_mask_for_roi,
-                roi_absolute_offset
-            )
-            output_display_image = processed_image_with_points # Update image with drawn points
+        segmentation_found_target = False
+        if self.enable_seg_param_ and segmentation_mask_in_roi is not None and cv2.countNonZero(segmentation_mask_in_roi) > 0:
+            segmentation_found_target = True
 
-            # Publish the selected points if segmentation is enabled and points were found
-            if self.enable_seg and points_to_publish:
-                # Create a new PointCloud2 message.
-                # The point_cloud2.create_cloud_xyz32 function will populate most of it.
-                # We need to provide it with a header.
-                # This header should use the frame_id and stamp of the LATEST incoming PC,
-                # because the data we are publishing is derived from that specific PC message.
+        # Start with the raw camera image for display
+        image_for_visualization = self.latest_image_.copy()
+        
+        points_for_viz_topic, points_on_target_for_goal_calc = [], []
 
-                header_for_selected_points = self.latest_pc.header # This copies the stamp and frame_id
+        if self.latest_pc_ is not None:
+            # This function handles projection for visualization AND extracts points for goal calculation
+            image_for_visualization, points_for_viz_topic, points_on_target_for_goal_calc = \
+                self.process_lidar_and_image_data(self.latest_image_, segmentation_mask_in_roi, roi_top_left_offset)
+        
+        # Publish the point cloud for visualization (points that fell in segmented region)
+        if self.enable_seg_param_ and points_for_viz_topic and self.latest_pc_:
+            pc_header_for_viz = self.latest_pc_.header # Use original lidar PC header
+            selected_cloud_msg = pc2.create_cloud_xyz32(pc_header_for_viz, points_for_viz_topic)
+            self.selected_points_publisher_.publish(selected_cloud_msg)
 
-                # The points_to_publish are in the self.latest_pc.header.frame_id
-                # (which is front_lidar_link_optical)
-                final_selected_cloud_msg = point_cloud2.create_cloud_xyz32(
-                    header_for_selected_points,
-                    points_to_publish
-                )
-                self.selected_points_publisher.publish(final_selected_cloud_msg)
-        else:
-            # self.get_logger().debug("No point cloud data yet to process for projection/publishing.")
-            pass # output_display_image remains self.latest_image.copy()
+        # If target processing is active AND we found points on the target, calculate and publish the goal
+        if self.process_and_publish_target_ and points_on_target_for_goal_calc and self.latest_pc_:
+            self.calculate_and_publish_corrected_goal(points_on_target_for_goal_calc, self.latest_pc_.header)
+        elif self.process_and_publish_target_ and not points_on_target_for_goal_calc:
+            # Active, but no target points found in this frame.
+            # Deactivation (publishing empty pose) is handled by the service call to SetBool=False.
+            # So, if process_and_publish_target_ is True but no points, we just don't publish a new goal.
+            self.get_logger().debug("Target processing active, but no target points found in current frame to form a goal.")
 
 
-        # --- Drawing ROI and Display ---
-        if self.enable_seg : # Only draw ROI if segmentation is enabled, or always? Let's say always for visualization
-            roi_color = (0, 255, 0) if segmentation_found_something else (255, 191, 0) # Green if found, light blue otherwise
+        if self.output_window_:
+            # Draw ROI border on the visualization image
+            if self.enable_seg_param_:
+                roi_color = (0, 255, 0) if segmentation_found_target else (255, 191, 0)
+                cv2.rectangle(image_for_visualization, 
+                              (self.roi_x_start, self.roi_y_start), 
+                              (self.roi_x_end - 1, self.roi_y_end - 1), 
+                              roi_color, 1)
             
-            cv2.line(output_display_image, 
-                     (self.roi_x_start, self.roi_y_start),
-                     (self.roi_x_end -1 , self.roi_y_start),
-                     roi_color, 1)
-            
-            y_bottom_line = self.roi_y_end -1 
-            if y_bottom_line >= self.roi_y_start:
-                cv2.line(output_display_image,
-                         (self.roi_x_start, y_bottom_line),
-                         (self.roi_x_end -1, y_bottom_line),
-                         roi_color, 1)
-            # Draw vertical lines for ROI too
-            cv2.line(output_display_image,
-                     (self.roi_x_start, self.roi_y_start),
-                     (self.roi_x_start, self.roi_y_end -1),
-                     roi_color, 1)
-            cv2.line(output_display_image,
-                     (self.roi_x_end -1, self.roi_y_start),
-                     (self.roi_x_end -1, self.roi_y_end -1),
-                     roi_color, 1)
+            display_img_resized = cv2.resize(image_for_visualization, (800, 600))
+            cv2.imshow(self.output_window_, display_img_resized)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.get_logger().info('Shutdown requested by Q key')
+                self.destroy_node() # This should trigger on_shutdown if overridden
+                rclpy.shutdown()
+                if self.output_window_: cv2.destroyAllWindows()
 
-
-        display_img_resized = cv2.resize(output_display_image, (800,600))
-        cv2.imshow(self.window, display_img_resized)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            self.get_logger().info('Shutdown requested')
-            self.destroy_node()
-            rclpy.shutdown()
+    def destroy_node(self): # Override to ensure windows close
+        self.get_logger().info("Destroying ROILidarFusionNode.")
+        if self.output_window_:
             cv2.destroyAllWindows()
+        super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ROILidarFusionNode()
+    node = None
     try:
+        node = ROILidarFusionNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Keyboard interrupt, shutting down...')
+        if node: node.get_logger().info('Keyboard interrupt, shutting down ROILidarFusionNode...')
+    except Exception as e:
+        if node: node.get_logger().error(f"Unhandled exception in ROILidarFusionNode: {e}\n{traceback.format_exc()}")
+        else: print(f"Unhandled exception during ROILidarFusionNode init: {e}\n{traceback.format_exc()}")
     finally:
-        if rclpy.ok(): # Check if rclpy context is still valid
-            if node.is_valid(): # Check if node is still valid before destroying
-                 node.destroy_node()
+        if node and rclpy.ok(): # Ensure node exists and rclpy is still ok
+            node.destroy_node()
+        if rclpy.ok():
             rclpy.shutdown()
-        cv2.destroyAllWindows()
+        # Ensure OpenCV windows are closed, even if destroy_node wasn't called or window wasn't set
+        if hasattr(node, 'output_window_') and node.output_window_:
+            cv2.destroyAllWindows()
+        elif cv2.getWindowProperty("Fused View", 0) >= 0 : # Check if window exists by name
+            cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
