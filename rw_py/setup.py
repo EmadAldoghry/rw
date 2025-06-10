@@ -21,7 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'follow_waypoints = rw_py.follow_waypoints:main',
-            'fusion_segmentation_node = rw_py.lidar_camera_fusion_segmentation_node:main',
+            'fusion_segmentation_node = rw_py.lidar_camera_fusion_node:main',
         ],
     },
 )

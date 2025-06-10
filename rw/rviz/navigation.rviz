@@ -418,9 +418,6 @@ Visualization Manager:
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        # CHANGE THIS LINE:
-        Reliability Policy: Best Effort  
-        # TO THIS:
         Reliability Policy: Reliable 
         Value: /particle_cloud
       Value: true
