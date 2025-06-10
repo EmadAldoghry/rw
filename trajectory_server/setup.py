@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'rw_py'
+package_name = 'trajectory_server'
 
 setup(
     name=package_name,
@@ -13,15 +13,15 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Emad Aldoghry',
-    maintainer_email='Aldoghry@isac.rwth-aachen.de',
-    description='Python nodes',
+    maintainer='',
+    maintainer_email='',
+    description='ROS2 trajectory server',
     license='Apache License 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'follow_waypoints = rw_py.follow_waypoints:main',
-            'fusion_segmentation_node = rw_py.lidar_camera_fusion_segmentation_node:main',
+            'trajectory_server = trajectory_server.trajectory:main',
+            'trajectory_server_topic_based = trajectory_server.trajectory_topic_based:main'
         ],
     },
 )

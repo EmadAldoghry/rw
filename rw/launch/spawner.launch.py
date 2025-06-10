@@ -265,16 +265,16 @@ def generate_launch_description():
 
     # --- Trajectory Servers (Keep both or choose one based on needs) ---
     trajectory_node = Node( # Assumes service-based?
-        package='mogi_trajectory_server',
-        executable='mogi_trajectory_server',
-        name='mogi_trajectory_server',
+        package='trajectory_server',
+        executable='trajectory_server',
+        name='trajectory_server',
         parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}] # Add use_sim_time if needed
     )
 
     trajectory_odom_topic_node = Node( # Topic-based
-        package='mogi_trajectory_server',
-        executable='mogi_trajectory_server_topic_based',
-        name='mogi_trajectory_server_odom_topic',
+        package='trajectory_server',
+        executable='trajectory_server_topic_based',
+        name='trajectory_server_odom_topic',
         parameters=[
             {'trajectory_topic': 'trajectory_raw'},
             {'odometry_topic': 'odom'}, # Make sure this matches your EKF output or bridged odom topic
