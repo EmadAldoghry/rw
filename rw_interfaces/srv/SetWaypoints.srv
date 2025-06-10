@@ -1,4 +1,0 @@
-geometry_msgs/PoseStamped[] waypoints
----
-bool success
-string message
