@@ -1,0 +1,85 @@
+poses:
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 90.4234, y: 5.6658, z: 0.0}
+    orientation: &id001 {x: 0.0, y: 0.0, z: 1.0, w: 0.0}
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 87.9232, y: 5.1113, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 86.4661, y: 3.6871, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 80.8341, y: 2.7392, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 77.4548, y: 2.6861, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 72.2572, y: 1.6765, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 69.1713, y: 1.8878, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 66.8086, y: 1.505, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 69.5291, y: 0.359, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 66.175, y: -0.2619, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 61.7764, y: 2.4365, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 54.0923, y: 1.2338, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 46.7231, y: -3.3097, z: 0.0}
+    orientation: *id001
+- header:
+    frame_id: map
+    stamp: {sec: 0, nanosec: 0}
+  pose:
+    position: {x: 37.9679, y: -4.8378, z: 0.0}
+    orientation: *id001
