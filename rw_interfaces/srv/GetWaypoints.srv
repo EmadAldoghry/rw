@@ -1,0 +1,7 @@
+# Request can be empty, or you could pass the yaml path for more flexibility
+string yaml_path_override
+---
+# Response is a list of waypoints
+geometry_msgs/PoseStamped[] waypoints
+bool success
+string message

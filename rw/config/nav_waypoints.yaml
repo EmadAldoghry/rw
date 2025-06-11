@@ -3,7 +3,7 @@ poses:
     frame_id: map
     stamp: {sec: 0, nanosec: 0}
   pose:
-    position: {x: 90.4234, y: 5.6658, z: 0.0}
+    position: {x: 90.4234, y: 5.0658, z: 0.0}
     orientation: &id001 {x: 0.0, y: 0.0, z: 1.0, w: 0.0}
 - header:
     frame_id: map

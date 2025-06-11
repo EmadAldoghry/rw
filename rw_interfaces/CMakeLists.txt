@@ -5,24 +5,18 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(std_msgs REQUIRED) # If your .msg files use Header etc. from std_msgs
-
-# This is crucial for rosidl_generate_interfaces
+find_package(std_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
-# Corrected path for msg file
-# Remember you have:
-# rw_interfaces/msg/NavigationStatus.msg
-# rw_interfaces/srv/ControlNavigation.srv
-# rw_interfaces/srv/SetWaypoints.srv
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/NavigationStatus.msg"
+  "msg/ProximityStatus.msg"  
   "srv/ControlNavigation.srv"
   "srv/SetWaypoints.srv"
-  DEPENDENCIES geometry_msgs std_msgs # Add std_msgs if NavigationStatus.msg uses Header
+  "srv/GetWaypoints.srv"
+  DEPENDENCIES geometry_msgs std_msgs
 )
 
 if(BUILD_TESTING)

@@ -22,6 +22,9 @@ setup(
         'console_scripts': [
             'follow_waypoints = rw_py.follow_waypoints:main',
             'fusion_segmentation_node = rw_py.lidar_camera_fusion_node:main',
+            'waypoint_server = rw_py.waypoint_server:main',
+            'proximity_monitor = rw_py.proximity_monitor:main',
+            'waypoint_visualizer = rw_py.waypoint_visualizer:main',
         ],
     },
 )

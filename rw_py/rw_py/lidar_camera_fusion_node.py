@@ -216,10 +216,11 @@ class ROILidarFusionNode(Node):
         return fused_image_display, points_for_viz_cloud, points_on_target_lidar_coords
 
     def calculate_and_publish_corrected_goal(self, points_on_target_lidar_frame: list, original_pc_header: Header):
-        self.get_logger().info(f"FINAL CORRECTED GOAL (map frame): X={corrected_goal_pose.pose.position.x:.3f}, Y={corrected_goal_pose.pose.position.y:.3f}, Z={corrected_goal_pose.pose.position.z:.3f}")
-        self.corrected_goal_publisher_.publish(corrected_goal_pose)
-        if not self.process_and_publish_target_: return
+        # 1. First, check if we should even be processing a goal.
+        if not self.process_and_publish_target_:
+            return
 
+        # 2. Handle the case where no target points were found.
         if not points_on_target_lidar_frame:
             self._publish_invalid_goal("No target points found to calculate corrected goal.")
             return
@@ -229,28 +230,50 @@ class ROILidarFusionNode(Node):
             self._publish_invalid_goal("Converted target points array is empty.")
             return
             
+        # 3. Calculate the centroid and create a stamped point in the Lidar's frame.
         centroid_lidar_frame = np.mean(target_points_np_lidar, axis=0)
-        pt_stamped_lidar = PointStamped(header=original_pc_header, point=Point(x=float(centroid_lidar_frame[0]), y=float(centroid_lidar_frame[1]), z=float(centroid_lidar_frame[2])))
+        pt_stamped_lidar = PointStamped(
+            header=original_pc_header, 
+            point=Point(x=float(centroid_lidar_frame[0]), y=float(centroid_lidar_frame[1]), z=float(centroid_lidar_frame[2]))
+        )
 
+        # 4. Try to transform the point and publish it.
         try:
             tf_stamp_to_use = pt_stamped_lidar.header.stamp
+            # Use current time if the sensor provides a zero timestamp
             if tf_stamp_to_use.sec == 0 and tf_stamp_to_use.nanosec == 0:
-                 tf_stamp_to_use = RclpyTime() # Use rclpy.time.Time() which defaults to node's clock
-                 self.get_logger().warn(f"Lidar PC header stamp was zero, using current time for TF: {tf_stamp_to_use.nanoseconds}")
+                 tf_stamp_to_use = RclpyTime()
+                 self.get_logger().warn(f"Lidar PC header stamp was zero, using current time for TF.")
 
-
+            # Look up the transform from the Lidar frame to the navigation frame (e.g., 'map')
             transform_to_nav_frame = self.tf_buffer_.lookup_transform(
                 self.navigation_frame_, pt_stamped_lidar.header.frame_id,
                 tf_stamp_to_use, timeout=RclpyDuration(seconds=0.5))
             
+            # Perform the transformation
             pt_stamped_nav_frame = do_transform_point(pt_stamped_lidar, transform_to_nav_frame)
-            corrected_goal_pose = GeometryPoseStamped(header=Header(stamp=self.get_clock().now().to_msg(), frame_id=self.navigation_frame_))
+            
+            # Create the final PoseStamped message
+            corrected_goal_pose = GeometryPoseStamped(
+                header=Header(stamp=self.get_clock().now().to_msg(), frame_id=self.navigation_frame_)
+            )
             corrected_goal_pose.pose.position = pt_stamped_nav_frame.point
-            q_identity = tf_transformations.quaternion_from_euler(0,0,0) 
-            corrected_goal_pose.pose.orientation = Quaternion(x=q_identity[0],y=q_identity[1],z=q_identity[2],w=q_identity[3])
+            
+            # Set a default neutral orientation (pointing forward along the frame's X-axis)
+            q_identity = tf_transformations.quaternion_from_euler(0, 0, 0) 
+            corrected_goal_pose.pose.orientation = Quaternion(x=q_identity[0], y=q_identity[1], z=q_identity[2], w=q_identity[3])
+
+            # --- ONLY NOW is it safe to log and publish ---
+            self.get_logger().info(
+                f"FINAL CORRECTED GOAL (map frame): "
+                f"X={corrected_goal_pose.pose.position.x:.3f}, "
+                f"Y={corrected_goal_pose.pose.position.y:.3f}, "
+                f"Z={corrected_goal_pose.pose.position.z:.3f}"
+            )
             self.corrected_goal_publisher_.publish(corrected_goal_pose)
-            self.get_logger().info(f"Published corrected local goal in '{self.navigation_frame_}': P({corrected_goal_pose.pose.position.x:.2f}, {corrected_goal_pose.pose.position.y:.2f})")
+
         except Exception as ex:
+            # If anything goes wrong (e.g., TF fails), publish an invalid goal
             self.get_logger().warn(f"TF/GoalPub Error: {ex}", throttle_duration_sec=2.0)
             self._publish_invalid_goal(f"TF Error: {ex}")
 
