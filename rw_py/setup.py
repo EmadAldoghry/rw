@@ -21,10 +21,15 @@ setup(
     entry_points={
         'console_scripts': [
             'follow_waypoints = rw_py.follow_waypoints:main',
-            'fusion_segmentation_node = rw_py.lidar_camera_fusion_node:main',
+
             'waypoint_server = rw_py.waypoint_server:main',
             'proximity_monitor = rw_py.proximity_monitor:main',
             'waypoint_visualizer = rw_py.waypoint_visualizer:main',
+
+            'image_segmenter_node = rw_py.image_segmenter_node:main',
+            'pointcloud_fuser_node = rw_py.pointcloud_fuser_node:main',
+            'goal_calculator_node = rw_py.goal_calculator_node:main',
+            'fusion_visualizer_node = rw_py.fusion_visualizer_node:main',
         ],
     },
 )
